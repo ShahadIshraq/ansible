@@ -228,15 +228,17 @@ from distutils.version import LooseVersion
 
 try:
     import boto
+    import boto3
     import boto.ec2
     import boto.exception
     from boto.exception import BotoServerError
+    from botocore.exceptions import ClientError
     from boto.ec2.blockdevicemapping import BlockDeviceType, BlockDeviceMapping
 except ImportError:
     pass  # Taken care of by ec2.HAS_BOTO
 
 from ansible.module_utils.basic import AnsibleModule
-from ansible.module_utils.ec2 import (HAS_BOTO, AnsibleAWSError, connect_to_aws, ec2_argument_spec,
+from ansible.module_utils.ec2 import (HAS_BOTO, HAS_BOTO3, AnsibleAWSError, connect_to_aws, ec2_argument_spec,
                                       get_aws_connection_info)
 
 
@@ -244,22 +246,21 @@ def get_volume(module, ec2):
     name = module.params.get('name')
     id = module.params.get('id')
     zone = module.params.get('zone')
-    filters = {}
-    volume_ids = None
+    filters = []
 
     # If no name or id supplied, just try volume creation based on module parameters
     if id is None and name is None:
         return None
 
     if zone:
-        filters['availability_zone'] = zone
+        filters.append({'Name': 'availability-zone', 'Value': [zone]})
     if name:
-        filters = {'tag:Name': name}
+        filters.append({'Name': 'tag:Name', 'Value': [name]})
     if id:
-        volume_ids = [id]
+        filters.append({'Name': 'volume-id', 'Value': [id]})
     try:
-        vols = ec2.get_all_volumes(volume_ids=volume_ids, filters=filters)
-    except boto.exception.BotoServerError as e:
+        vols = ec2.volumes.filter(Filters=filters)
+    except ClientError as e:
         module.fail_json(msg="%s: %s" % (e.error_code, e.error_message))
 
     if not vols:
@@ -282,43 +283,23 @@ def get_volumes(module, ec2):
 
     try:
         if not instance:
-            vols = ec2.get_all_volumes()
+            vols = ec2.volumes.all()
         else:
-            vols = ec2.get_all_volumes(filters={'attachment.instance-id': instance})
-    except boto.exception.BotoServerError as e:
+            vols = ec2.volumes.filter(Filters=[{'attachment.instance-id': instance}])
+    except ClientError as e:
         module.fail_json(msg="%s: %s" % (e.error_code, e.error_message))
     return vols
 
 
 def delete_volume(module, ec2):
-    volume_id = module.params['id']
+    volume = ec2.Volume(module.params['id'])
     try:
-        ec2.delete_volume(volume_id)
+        volume.delete()
         module.exit_json(changed=True)
-    except boto.exception.EC2ResponseError as ec2_error:
-        if ec2_error.code == 'InvalidVolume.NotFound':
+    except ClientError as ec2_error:
+        if ec2_error.response['Error']['Code'] == 'InvalidVolume.NotFound':
             module.exit_json(changed=False)
-        module.fail_json(msg=ec2_error.message)
-
-
-def boto_supports_volume_encryption():
-    """
-    Check if Boto library supports encryption of EBS volumes (added in 2.29.0)
-
-    Returns:
-        True if boto library has the named param as an argument on the request_spot_instances method, else False
-    """
-    return hasattr(boto, 'Version') and LooseVersion(boto.Version) >= LooseVersion('2.29.0')
-
-
-def boto_supports_kms_key_id():
-    """
-    Check if Boto library supports kms_key_ids (added in 2.39.0)
-
-    Returns:
-        True if version is equal to or higher then the version needed, else False
-    """
-    return hasattr(boto, 'Version') and LooseVersion(boto.Version) >= LooseVersion('2.39.0')
+        module.fail_json(msg=ec2_error.response['Error']['Message'])
 
 
 def create_volume(module, ec2, zone):
@@ -338,25 +319,21 @@ def create_volume(module, ec2, zone):
     volume = get_volume(module, ec2)
     if volume is None:
         try:
-            if boto_supports_volume_encryption():
-                if kms_key_id is not None:
-                    volume = ec2.create_volume(volume_size, zone, snapshot, volume_type, iops, encrypted, kms_key_id)
-                else:
-                    volume = ec2.create_volume(volume_size, zone, snapshot, volume_type, iops, encrypted)
-                changed = True
+            if kms_key_id is not None:
+                volume = ec2.create_volume(volume_size, zone, snapshot, volume_type, iops, encrypted, kms_key_id)
             else:
-                volume = ec2.create_volume(volume_size, zone, snapshot, volume_type, iops)
-                changed = True
+                volume = ec2.create_volume(volume_size, zone, snapshot, volume_type, iops, encrypted)
+            changed = True
 
-            while volume.status != 'available':
+            while volume.state != 'available':
                 time.sleep(3)
-                volume.update()
+                volume.reload()
 
             if name:
                 tags["Name"] = name
             if tags:
                 ec2.create_tags([volume.id], tags)
-        except boto.exception.BotoServerError as e:
+        except ClientError as e:
             module.fail_json(msg="%s: %s" % (e.error_code, e.error_message))
 
     return volume, changed
@@ -442,7 +419,6 @@ def detach_volume(module, ec2, volume):
     changed = False
 
     if volume.attachment_state() is not None:
-        adata = volume.attach_data
         volume.detach()
         while volume.attachment_state() is not None:
             time.sleep(3)
@@ -456,10 +432,10 @@ def get_volume_info(volume, state):
 
     # If we're just listing volumes then do nothing, else get the latest update for the volume
     if state != 'list':
-        volume.update()
+        volume.relode()
 
     volume_info = {}
-    attachment = volume.attach_data
+    attachment = volume.attachments[0]
 
     volume_info = {
         'create_time': volume.create_time,
@@ -468,18 +444,18 @@ def get_volume_info(volume, state):
         'iops': volume.iops,
         'size': volume.size,
         'snapshot_id': volume.snapshot_id,
-        'status': volume.status,
-        'type': volume.type,
-        'zone': volume.zone,
+        'state': volume.state,
+        'volume_type': volume.volume_type,
+        'availability_zone': volume.availability_zone,
         'attachment_set': {
-            'attach_time': attachment.attach_time,
-            'device': attachment.device,
-            'instance_id': attachment.instance_id,
-            'status': attachment.status
+            'attach_time': attachment['AttachTime'],
+            'device': attachment['Device'],
+            'instance_id': attachment['InstanceId'],
+            'state': attachment['State']
         },
         'tags': volume.tags
     }
-    if hasattr(attachment, 'deleteOnTermination'):
+    if hasattr(attachment, 'DeleteOnTermination'):
         volume_info['attachment_set']['deleteOnTermination'] = attachment.deleteOnTermination
 
     return volume_info
@@ -509,6 +485,9 @@ def main():
     if not HAS_BOTO:
         module.fail_json(msg='boto required for this module')
 
+    if not HAS_BOTO3:
+        module.fail_json(msg='boto3 required for this module')
+
     id = module.params.get('id')
     name = module.params.get('name')
     instance = module.params.get('instance')
@@ -535,12 +514,12 @@ def main():
     # Set changed flag
     changed = False
 
-    region, ec2_url, aws_connect_params = get_aws_connection_info(module)
+    region, ec2_url, aws_connect_params = get_aws_connection_info(module=module, boto3=True)
 
     if region:
         try:
-            ec2 = connect_to_aws(boto.ec2, region, **aws_connect_params)
-        except (boto.exception.NoAuthHandlerFound, AnsibleAWSError) as e:
+            ec2 = boto3.resource('ec2', region_name=region, **aws_connect_params)
+        except AnsibleAWSError as e:
             module.fail_json(msg=str(e))
     else:
         module.fail_json(msg="region must be specified")
@@ -550,17 +529,9 @@ def main():
         vols = get_volumes(module, ec2)
 
         for v in vols:
-            attachment = v.attach_data
-
             returned_volumes.append(get_volume_info(v, state))
 
         module.exit_json(changed=False, volumes=returned_volumes)
-
-    if encrypted and not boto_supports_volume_encryption():
-        module.fail_json(msg="You must use boto >= v2.29.0 to use encrypted volumes")
-
-    if kms_key_id is not None and not boto_supports_kms_key_id():
-        module.fail_json(msg="You must use boto >= v2.39.0 to use kms_key_id")
 
     # Here we need to get the zone info for the instance. This covers situation where
     # instance is specified but zone isn't.
@@ -569,19 +540,19 @@ def main():
     inst = None
     if instance:
         try:
-            reservation = ec2.get_all_instances(instance_ids=instance)
-        except BotoServerError as e:
+            inst = ec2.Instance(instance)
+        except ClientError as e:
             module.fail_json(msg=e.message)
-        inst = reservation[0].instances[0]
-        zone = inst.placement
+        zone = inst.placement['AvailabilityZone']
 
         # Check if there is a volume already mounted there.
         if device_name:
-            if device_name in inst.block_device_mapping:
-                module.exit_json(msg="Volume mapping for %s already exists on instance %s" % (device_name, instance),
-                                 volume_id=inst.block_device_mapping[device_name].volume_id,
-                                 device=device_name,
-                                 changed=False)
+            for mapping in inst.block_device_mappings:
+                if device_name == mapping['DeviceName']:
+                    module.exit_json(msg="Volume mapping for %s already exists on instance %s" % (device_name, instance),
+                                    volume_id=mapping['Ebs']['VolumeId'],
+                                    device=device_name,
+                                    changed=False)
 
     # Delaying the checks until after the instance check allows us to get volume ids for existing volumes
     # without needing to pass an unused volume_size
